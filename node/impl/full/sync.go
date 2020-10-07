@@ -57,7 +57,7 @@ func (a *SyncAPI) SyncSubmitBlock(ctx context.Context, blk *types.BlockMsg) erro
 
 	if err := a.SlashFilter.MinedBlock(blk.Header, parent.Height); err != nil {
 		log.Errorf("<!!> SLASH FILTER ERROR: %s", err)
-		return xerrors.Errorf("<!!> SLASH FILTER ERROR: %w", err)
+		//return xerrors.Errorf("<!!> SLASH FILTER ERROR: %w", err)
 	}
 
 	// TODO: should we have some sort of fast path to adding a local block?

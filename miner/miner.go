@@ -68,7 +68,7 @@ func NewMiner(api api.FullNode, epp gen.WinningPoStProver, addr address.Address,
 
 			build.Clock.Sleep(build.Clock.Until(baseT))
 
-			return func(bool, abi.ChainEpoch, error) {}, 0, nil
+			return func(bool, abi.ChainEpoch, error) {}, -1, nil
 		},
 
 		sf:                sf,
@@ -263,11 +263,13 @@ minerLoop:
 				log.Warnw("mined block in the past",
 					"block-time", btime, "time", build.Clock.Now(), "difference", build.Clock.Since(btime))
 			}
+                        /*
 
 			if err := m.sf.MinedBlock(b.Header, base.TipSet.Height()+base.NullRounds); err != nil {
 				log.Errorf("<!!> SLASH FILTER ERROR: %s", err)
-				continue
+				// continue
 			}
+                      
 
 			blkKey := fmt.Sprintf("%d", b.Header.Height)
 			if _, ok := m.minedBlockHeights.Get(blkKey); ok {
@@ -276,6 +278,7 @@ minerLoop:
 			}
 
 			m.minedBlockHeights.Add(blkKey, true)
+                        */
 
 			if err := m.api.SyncSubmitBlock(ctx, b); err != nil {
 				log.Errorf("failed to submit newly mined block: %s", err)
