@@ -19,8 +19,22 @@ import (
 func TestCCUpgrade(t *testing.T, b APIBuilder, blocktime time.Duration) {
 	_ = os.Setenv("BELLMAN_NO_GPU", "1")
 
+	for _, height := range []abi.ChainEpoch{
+		1,    // before
+		162,  // while sealing
+		520,  // after upgrade deal
+		5000, // after
+	} {
+		height := height // make linters happy by copying
+		t.Run(fmt.Sprintf("upgrade-%d", height), func(t *testing.T) {
+			testCCUpgrade(t, b, blocktime, height)
+		})
+	}
+}
+
+func testCCUpgrade(t *testing.T, b APIBuilder, blocktime time.Duration, upgradeHeight abi.ChainEpoch) {
 	ctx := context.Background()
-	n, sn := b(t, 1, OneMiner)
+	n, sn := b(t, []FullNodeOpts{FullNodeWithUpgradeAt(upgradeHeight)}, OneMiner)
 	client := n[0].FullNode.(*impl.FullNodeAPI)
 	miner := sn[0]
 

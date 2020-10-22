@@ -6,45 +6,159 @@ import (
 	"encoding/binary"
 	"math"
 
-	multisig0 "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
-
-	"github.com/filecoin-project/lotus/chain/actors/builtin/multisig"
-
-	"github.com/filecoin-project/lotus/chain/state"
-
-	"github.com/filecoin-project/specs-actors/actors/migration/nv3"
-
-	"github.com/ipfs/go-cid"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/network"
+	"github.com/ipfs/go-cid"
+	cbor "github.com/ipfs/go-ipld-cbor"
+	"golang.org/x/xerrors"
 
 	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
-	init0 "github.com/filecoin-project/specs-actors/actors/builtin/init"
 	miner0 "github.com/filecoin-project/specs-actors/actors/builtin/miner"
+	multisig0 "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
 	power0 "github.com/filecoin-project/specs-actors/actors/builtin/power"
 	adt0 "github.com/filecoin-project/specs-actors/actors/util/adt"
 
+	"github.com/filecoin-project/specs-actors/actors/migration/nv3"
+	m2 "github.com/filecoin-project/specs-actors/v2/actors/migration"
+
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
+	init_ "github.com/filecoin-project/lotus/chain/actors/builtin/init"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/multisig"
+	"github.com/filecoin-project/lotus/chain/state"
+	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
-	cbor "github.com/ipfs/go-ipld-cbor"
-	"golang.org/x/xerrors"
+	bstore "github.com/filecoin-project/lotus/lib/blockstore"
+	"github.com/filecoin-project/lotus/lib/bufbstore"
 )
 
-var ForksAtHeight = map[abi.ChainEpoch]func(context.Context, *StateManager, ExecCallback, cid.Cid, *types.TipSet) (cid.Cid, error){
-	build.UpgradeBreezeHeight:   UpgradeFaucetBurnRecovery,
-	build.UpgradeIgnitionHeight: UpgradeIgnition,
-	build.UpgradeLiftoffHeight:  UpgradeLiftoff,
+// UpgradeFunc is a migration function run at every upgrade.
+//
+// - The oldState is the state produced by the upgrade epoch.
+// - The returned newState is the new state that will be used by the next epoch.
+// - The height is the upgrade epoch height (already executed).
+// - The tipset is the tipset for the last non-null block before the upgrade. Do
+//   not assume that ts.Height() is the upgrade height.
+type UpgradeFunc func(ctx context.Context, sm *StateManager, cb ExecCallback, oldState cid.Cid, height abi.ChainEpoch, ts *types.TipSet) (newState cid.Cid, err error)
+
+type Upgrade struct {
+	Height    abi.ChainEpoch
+	Network   network.Version
+	Expensive bool
+	Migration UpgradeFunc
+}
+
+type UpgradeSchedule []Upgrade
+
+func DefaultUpgradeSchedule() UpgradeSchedule {
+	var us UpgradeSchedule
+
+	updates := []Upgrade{{
+		Height:    build.UpgradeBreezeHeight,
+		Network:   network.Version1,
+		Migration: UpgradeFaucetBurnRecovery,
+	}, {
+		Height:    build.UpgradeSmokeHeight,
+		Network:   network.Version2,
+		Migration: nil,
+	}, {
+		Height:    build.UpgradeIgnitionHeight,
+		Network:   network.Version3,
+		Migration: UpgradeIgnition,
+	}, {
+		Height:    build.UpgradeRefuelHeight,
+		Network:   network.Version3,
+		Migration: UpgradeRefuel,
+	}, {
+		Height:    build.UpgradeActorsV2Height,
+		Network:   network.Version4,
+		Expensive: true,
+		Migration: UpgradeActorsV2,
+	}, {
+		Height:  build.UpgradeTapeHeight,
+		Network: network.Version5,
+	}, {
+		Height:    build.UpgradeLiftoffHeight,
+		Network:   network.Version5,
+		Migration: UpgradeLiftoff,
+	}, {
+		Height:    build.UpgradeKumquatHeight,
+		Network:   network.Version6,
+		Migration: nil,
+	}}
+
+	if build.UpgradeActorsV2Height == math.MaxInt64 { // disable actors upgrade
+		updates = []Upgrade{{
+			Height:    build.UpgradeBreezeHeight,
+			Network:   network.Version1,
+			Migration: UpgradeFaucetBurnRecovery,
+		}, {
+			Height:    build.UpgradeSmokeHeight,
+			Network:   network.Version2,
+			Migration: nil,
+		}, {
+			Height:    build.UpgradeIgnitionHeight,
+			Network:   network.Version3,
+			Migration: UpgradeIgnition,
+		}, {
+			Height:    build.UpgradeRefuelHeight,
+			Network:   network.Version3,
+			Migration: UpgradeRefuel,
+		}, {
+			Height:    build.UpgradeLiftoffHeight,
+			Network:   network.Version3,
+			Migration: UpgradeLiftoff,
+		}}
+	}
+
+	for _, u := range updates {
+		if u.Height < 0 {
+			// upgrade disabled
+			continue
+		}
+		us = append(us, u)
+	}
+	return us
+}
+
+func (us UpgradeSchedule) Validate() error {
+	// Make sure we're not trying to upgrade to version 0.
+	for _, u := range us {
+		if u.Network <= 0 {
+			return xerrors.Errorf("cannot upgrade to version <= 0: %d", u.Network)
+		}
+	}
+
+	// Make sure all the upgrades make sense.
+	for i := 1; i < len(us); i++ {
+		prev := &us[i-1]
+		curr := &us[i]
+		if !(prev.Network <= curr.Network) {
+			return xerrors.Errorf("cannot downgrade from version %d to version %d", prev.Network, curr.Network)
+		}
+		// Make sure the heights make sense.
+		if prev.Height < 0 {
+			// Previous upgrade was disabled.
+			continue
+		}
+		if !(prev.Height < curr.Height) {
+			return xerrors.Errorf("upgrade heights must be strictly increasing: upgrade %d was at height %d, followed by upgrade %d at height %d", i-1, prev.Height, i, curr.Height)
+		}
+	}
+	return nil
 }
 
 func (sm *StateManager) handleStateForks(ctx context.Context, root cid.Cid, height abi.ChainEpoch, cb ExecCallback, ts *types.TipSet) (cid.Cid, error) {
 	retCid := root
 	var err error
-	f, ok := ForksAtHeight[height]
+	f, ok := sm.stateMigrations[height]
 	if ok {
-		retCid, err = f(ctx, sm, cb, root, ts)
+		retCid, err = f(ctx, sm, cb, root, height, ts)
 		if err != nil {
 			return cid.Undef, err
 		}
@@ -53,7 +167,12 @@ func (sm *StateManager) handleStateForks(ctx context.Context, root cid.Cid, heig
 	return retCid, nil
 }
 
-func doTransfer(cb ExecCallback, tree types.StateTree, from, to address.Address, amt abi.TokenAmount) error {
+func (sm *StateManager) hasExpensiveFork(ctx context.Context, height abi.ChainEpoch) bool {
+	_, ok := sm.expensiveUpgrades[height]
+	return ok
+}
+
+func doTransfer(tree types.StateTree, from, to address.Address, amt abi.TokenAmount, cb func(trace types.ExecutionTrace)) error {
 	fromAct, err := tree.GetActor(from)
 	if err != nil {
 		return xerrors.Errorf("failed to get 'from' actor for transfer: %w", err)
@@ -86,7 +205,6 @@ func doTransfer(cb ExecCallback, tree types.StateTree, from, to address.Address,
 			From:  from,
 			To:    to,
 			Value: amt,
-			Nonce: math.MaxUint64,
 		}
 		fakeRct := &types.MessageReceipt{
 			ExitCode: 0,
@@ -94,28 +212,20 @@ func doTransfer(cb ExecCallback, tree types.StateTree, from, to address.Address,
 			GasUsed:  0,
 		}
 
-		if err := cb(fakeMsg.Cid(), fakeMsg, &vm.ApplyRet{
-			MessageReceipt: *fakeRct,
-			ActorErr:       nil,
-			ExecutionTrace: types.ExecutionTrace{
-				Msg:        fakeMsg,
-				MsgRct:     fakeRct,
-				Error:      "",
-				Duration:   0,
-				GasCharges: nil,
-				Subcalls:   nil,
-			},
-			Duration: 0,
-			GasCosts: vm.ZeroGasOutputs(),
-		}); err != nil {
-			return xerrors.Errorf("recording transfer: %w", err)
-		}
+		cb(types.ExecutionTrace{
+			Msg:        fakeMsg,
+			MsgRct:     fakeRct,
+			Error:      "",
+			Duration:   0,
+			GasCharges: nil,
+			Subcalls:   nil,
+		})
 	}
 
 	return nil
 }
 
-func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCallback, root cid.Cid, ts *types.TipSet) (cid.Cid, error) {
+func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCallback, root cid.Cid, epoch abi.ChainEpoch, ts *types.TipSet) (cid.Cid, error) {
 	// Some initial parameters
 	FundsForMiners := types.FromFil(1_000_000)
 	LookbackEpoch := abi.ChainEpoch(32000)
@@ -150,11 +260,6 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 		return cid.Undef, xerrors.Errorf("loading state tree failed: %w", err)
 	}
 
-	ReserveAddress, err := address.NewFromString("t090")
-	if err != nil {
-		return cid.Undef, xerrors.Errorf("failed to parse reserve address: %w", err)
-	}
-
 	tree, err := sm.StateTree(root)
 	if err != nil {
 		return cid.Undef, xerrors.Errorf("getting state tree: %w", err)
@@ -167,6 +272,10 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 	}
 
 	var transfers []transfer
+	subcalls := make([]types.ExecutionTrace, 0)
+	transferCb := func(trace types.ExecutionTrace) {
+		subcalls = append(subcalls, trace)
+	}
 
 	// Take all excess funds away, put them into the reserve account
 	err = tree.ForEach(func(addr address.Address, act *types.Actor) error {
@@ -180,7 +289,7 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 			if !sysAcc {
 				transfers = append(transfers, transfer{
 					From: addr,
-					To:   ReserveAddress,
+					To:   builtin.ReserveAddress,
 					Amt:  act.Balance,
 				})
 			}
@@ -202,11 +311,13 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 				available = st.GetAvailableBalance(act.Balance)
 			}
 
-			transfers = append(transfers, transfer{
-				From: addr,
-				To:   ReserveAddress,
-				Amt:  available,
-			})
+			if !available.IsZero() {
+				transfers = append(transfers, transfer{
+					From: addr,
+					To:   builtin.ReserveAddress,
+					Amt:  available,
+				})
+			}
 		}
 		return nil
 	})
@@ -216,7 +327,7 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 
 	// Execute transfers from previous step
 	for _, t := range transfers {
-		if err := doTransfer(cb, tree, t.From, t.To, t.Amt); err != nil {
+		if err := doTransfer(tree, t.From, t.To, t.Amt, transferCb); err != nil {
 			return cid.Undef, xerrors.Errorf("transfer %s %s->%s failed: %w", t.Amt, t.From, t.To, err)
 		}
 	}
@@ -255,7 +366,7 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 			nbalance := big.Min(prevBalance, AccountCap)
 			if nbalance.Sign() != 0 {
 				transfersBack = append(transfersBack, transfer{
-					From: ReserveAddress,
+					From: builtin.ReserveAddress,
 					To:   addr,
 					Amt:  nbalance,
 				})
@@ -282,7 +393,7 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 
 			mfunds := minerFundsAlloc(power, totalPower)
 			transfersBack = append(transfersBack, transfer{
-				From: ReserveAddress,
+				From: builtin.ReserveAddress,
 				To:   minfo.Worker,
 				Amt:  mfunds,
 			})
@@ -302,7 +413,7 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 
 				if lbsectors.Length() > 0 {
 					transfersBack = append(transfersBack, transfer{
-						From: ReserveAddress,
+						From: builtin.ReserveAddress,
 						To:   minfo.Worker,
 						Amt:  BaseMinerBalance,
 					})
@@ -319,7 +430,7 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 	}
 
 	for _, t := range transfersBack {
-		if err := doTransfer(cb, tree, t.From, t.To, t.Amt); err != nil {
+		if err := doTransfer(tree, t.From, t.To, t.Amt, transferCb); err != nil {
 			return cid.Undef, xerrors.Errorf("transfer %s %s->%s failed: %w", t.Amt, t.From, t.To, err)
 		}
 	}
@@ -329,7 +440,7 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 	if err != nil {
 		return cid.Undef, xerrors.Errorf("failed to load burnt funds actor: %w", err)
 	}
-	if err := doTransfer(cb, tree, builtin0.BurntFundsActorAddr, ReserveAddress, burntAct.Balance); err != nil {
+	if err := doTransfer(tree, builtin0.BurntFundsActorAddr, builtin.ReserveAddress, burntAct.Balance, transferCb); err != nil {
 		return cid.Undef, xerrors.Errorf("failed to unburn funds: %w", err)
 	}
 
@@ -345,7 +456,7 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 	}
 
 	difference := types.BigSub(DesiredReimbursementBalance, reimb.Balance)
-	if err := doTransfer(cb, tree, ReserveAddress, reimbAddr, difference); err != nil {
+	if err := doTransfer(tree, builtin.ReserveAddress, reimbAddr, difference, transferCb); err != nil {
 		return cid.Undef, xerrors.Errorf("failed to top up reimbursement account: %w", err)
 	}
 
@@ -364,13 +475,50 @@ func UpgradeFaucetBurnRecovery(ctx context.Context, sm *StateManager, cb ExecCal
 		return cid.Undef, xerrors.Errorf("resultant state tree account balance was not correct: %s", total)
 	}
 
+	if cb != nil {
+		// record the transfer in execution traces
+
+		fakeMsg := &types.Message{
+			From:  builtin.SystemActorAddr,
+			To:    builtin.SystemActorAddr,
+			Value: big.Zero(),
+			Nonce: uint64(epoch),
+		}
+		fakeRct := &types.MessageReceipt{
+			ExitCode: 0,
+			Return:   nil,
+			GasUsed:  0,
+		}
+
+		if err := cb(fakeMsg.Cid(), fakeMsg, &vm.ApplyRet{
+			MessageReceipt: *fakeRct,
+			ActorErr:       nil,
+			ExecutionTrace: types.ExecutionTrace{
+				Msg:        fakeMsg,
+				MsgRct:     fakeRct,
+				Error:      "",
+				Duration:   0,
+				GasCharges: nil,
+				Subcalls:   subcalls,
+			},
+			Duration: 0,
+			GasCosts: nil,
+		}); err != nil {
+			return cid.Undef, xerrors.Errorf("recording transfers: %w", err)
+		}
+	}
+
 	return tree.Flush(ctx)
 }
 
-func UpgradeIgnition(ctx context.Context, sm *StateManager, cb ExecCallback, root cid.Cid, ts *types.TipSet) (cid.Cid, error) {
+func UpgradeIgnition(ctx context.Context, sm *StateManager, cb ExecCallback, root cid.Cid, epoch abi.ChainEpoch, ts *types.TipSet) (cid.Cid, error) {
 	store := sm.cs.Store(ctx)
 
-	nst, err := nv3.MigrateStateTree(ctx, store, root, build.UpgradeIgnitionHeight)
+	if build.UpgradeLiftoffHeight <= epoch {
+		return cid.Undef, xerrors.Errorf("liftoff height must be beyond ignition height")
+	}
+
+	nst, err := nv3.MigrateStateTree(ctx, store, root, epoch)
 	if err != nil {
 		return cid.Undef, xerrors.Errorf("migrating actors state: %w", err)
 	}
@@ -395,22 +543,22 @@ func UpgradeIgnition(ctx context.Context, sm *StateManager, cb ExecCallback, roo
 		return cid.Undef, xerrors.Errorf("second split address: %w", err)
 	}
 
-	err = resetGenesisMsigs(ctx, sm, store, tree)
+	err = resetGenesisMsigs(ctx, sm, store, tree, build.UpgradeLiftoffHeight)
 	if err != nil {
 		return cid.Undef, xerrors.Errorf("resetting genesis msig start epochs: %w", err)
 	}
 
-	err = splitGenesisMultisig(ctx, cb, split1, store, tree, 50)
+	err = splitGenesisMultisig(ctx, cb, split1, store, tree, 50, epoch)
 	if err != nil {
 		return cid.Undef, xerrors.Errorf("splitting first msig: %w", err)
 	}
 
-	err = splitGenesisMultisig(ctx, cb, split2, store, tree, 50)
+	err = splitGenesisMultisig(ctx, cb, split2, store, tree, 50, epoch)
 	if err != nil {
 		return cid.Undef, xerrors.Errorf("splitting second msig: %w", err)
 	}
 
-	err = nv3.CheckStateTree(ctx, store, nst, build.UpgradeIgnitionHeight, builtin0.TotalFilecoin)
+	err = nv3.CheckStateTree(ctx, store, nst, epoch, builtin0.TotalFilecoin)
 	if err != nil {
 		return cid.Undef, xerrors.Errorf("sanity check after ignition upgrade failed: %w", err)
 	}
@@ -418,7 +566,79 @@ func UpgradeIgnition(ctx context.Context, sm *StateManager, cb ExecCallback, roo
 	return tree.Flush(ctx)
 }
 
-func UpgradeLiftoff(ctx context.Context, sm *StateManager, cb ExecCallback, root cid.Cid, ts *types.TipSet) (cid.Cid, error) {
+func UpgradeRefuel(ctx context.Context, sm *StateManager, cb ExecCallback, root cid.Cid, epoch abi.ChainEpoch, ts *types.TipSet) (cid.Cid, error) {
+
+	store := sm.cs.Store(ctx)
+	tree, err := sm.StateTree(root)
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("getting state tree: %w", err)
+	}
+
+	err = resetMultisigVesting(ctx, store, tree, builtin.SaftAddress, 0, 0, big.Zero())
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("tweaking msig vesting: %w", err)
+	}
+
+	err = resetMultisigVesting(ctx, store, tree, builtin.ReserveAddress, 0, 0, big.Zero())
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("tweaking msig vesting: %w", err)
+	}
+
+	err = resetMultisigVesting(ctx, store, tree, builtin.RootVerifierAddress, 0, 0, big.Zero())
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("tweaking msig vesting: %w", err)
+	}
+
+	return tree.Flush(ctx)
+}
+
+func UpgradeActorsV2(ctx context.Context, sm *StateManager, cb ExecCallback, root cid.Cid, epoch abi.ChainEpoch, ts *types.TipSet) (cid.Cid, error) {
+	buf := bufbstore.NewTieredBstore(sm.cs.Blockstore(), bstore.NewTemporarySync())
+	store := store.ActorStore(ctx, buf)
+
+	info, err := store.Put(ctx, new(types.StateInfo0))
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("failed to create new state info for actors v2: %w", err)
+	}
+
+	newHamtRoot, err := m2.MigrateStateTree(ctx, store, root, epoch, m2.DefaultConfig())
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("upgrading to actors v2: %w", err)
+	}
+
+	newRoot, err := store.Put(ctx, &types.StateRoot{
+		Version: types.StateTreeVersion1,
+		Actors:  newHamtRoot,
+		Info:    info,
+	})
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("failed to persist new state root: %w", err)
+	}
+
+	// perform some basic sanity checks to make sure everything still works.
+	if newSm, err := state.LoadStateTree(store, newRoot); err != nil {
+		return cid.Undef, xerrors.Errorf("state tree sanity load failed: %w", err)
+	} else if newRoot2, err := newSm.Flush(ctx); err != nil {
+		return cid.Undef, xerrors.Errorf("state tree sanity flush failed: %w", err)
+	} else if newRoot2 != newRoot {
+		return cid.Undef, xerrors.Errorf("state-root mismatch: %s != %s", newRoot, newRoot2)
+	} else if _, err := newSm.GetActor(builtin0.InitActorAddr); err != nil {
+		return cid.Undef, xerrors.Errorf("failed to load init actor after upgrade: %w", err)
+	}
+
+	{
+		from := buf
+		to := buf.Read()
+
+		if err := vm.Copy(ctx, from, to, newRoot); err != nil {
+			return cid.Undef, xerrors.Errorf("copying migrated tree: %w", err)
+		}
+	}
+
+	return newRoot, nil
+}
+
+func UpgradeLiftoff(ctx context.Context, sm *StateManager, cb ExecCallback, root cid.Cid, epoch abi.ChainEpoch, ts *types.TipSet) (cid.Cid, error) {
 	tree, err := sm.StateTree(root)
 	if err != nil {
 		return cid.Undef, xerrors.Errorf("getting state tree: %w", err)
@@ -432,20 +652,22 @@ func UpgradeLiftoff(ctx context.Context, sm *StateManager, cb ExecCallback, root
 	return tree.Flush(ctx)
 }
 
-func setNetworkName(ctx context.Context, store adt0.Store, tree *state.StateTree, name string) error {
+func setNetworkName(ctx context.Context, store adt.Store, tree *state.StateTree, name string) error {
 	ia, err := tree.GetActor(builtin0.InitActorAddr)
 	if err != nil {
 		return xerrors.Errorf("getting init actor: %w", err)
 	}
 
-	var initState init0.State
-	if err := store.Get(ctx, ia.Head, &initState); err != nil {
+	initState, err := init_.Load(store, ia)
+	if err != nil {
 		return xerrors.Errorf("reading init state: %w", err)
 	}
 
-	initState.NetworkName = name
+	if err := initState.SetNetworkName(name); err != nil {
+		return xerrors.Errorf("setting network name: %w", err)
+	}
 
-	ia.Head, err = store.Put(ctx, &initState)
+	ia.Head, err = store.Put(ctx, initState)
 	if err != nil {
 		return xerrors.Errorf("writing new init state: %w", err)
 	}
@@ -457,7 +679,7 @@ func setNetworkName(ctx context.Context, store adt0.Store, tree *state.StateTree
 	return nil
 }
 
-func splitGenesisMultisig(ctx context.Context, cb ExecCallback, addr address.Address, store adt0.Store, tree *state.StateTree, portions uint64) error {
+func splitGenesisMultisig(ctx context.Context, cb ExecCallback, addr address.Address, store adt0.Store, tree *state.StateTree, portions uint64, epoch abi.ChainEpoch) error {
 	if portions < 1 {
 		return xerrors.Errorf("cannot split into 0 portions")
 	}
@@ -526,6 +748,11 @@ func splitGenesisMultisig(ctx context.Context, cb ExecCallback, addr address.Add
 	}
 
 	i := uint64(0)
+	subcalls := make([]types.ExecutionTrace, 0, portions)
+	transferCb := func(trace types.ExecutionTrace) {
+		subcalls = append(subcalls, trace)
+	}
+
 	for i < portions {
 		keyAddr, err := makeKeyAddr(addr, i)
 		if err != nil {
@@ -542,11 +769,44 @@ func splitGenesisMultisig(ctx context.Context, cb ExecCallback, addr address.Add
 			return xerrors.Errorf("setting new msig actor state: %w", err)
 		}
 
-		if err := doTransfer(cb, tree, addr, idAddr, newIbal); err != nil {
+		if err := doTransfer(tree, addr, idAddr, newIbal, transferCb); err != nil {
 			return xerrors.Errorf("transferring split msig balance: %w", err)
 		}
 
 		i++
+	}
+
+	if cb != nil {
+		// record the transfer in execution traces
+
+		fakeMsg := &types.Message{
+			From:  builtin.SystemActorAddr,
+			To:    addr,
+			Value: big.Zero(),
+			Nonce: uint64(epoch),
+		}
+		fakeRct := &types.MessageReceipt{
+			ExitCode: 0,
+			Return:   nil,
+			GasUsed:  0,
+		}
+
+		if err := cb(fakeMsg.Cid(), fakeMsg, &vm.ApplyRet{
+			MessageReceipt: *fakeRct,
+			ActorErr:       nil,
+			ExecutionTrace: types.ExecutionTrace{
+				Msg:        fakeMsg,
+				MsgRct:     fakeRct,
+				Error:      "",
+				Duration:   0,
+				GasCharges: nil,
+				Subcalls:   subcalls,
+			},
+			Duration: 0,
+			GasCosts: nil,
+		}); err != nil {
+			return xerrors.Errorf("recording transfers: %w", err)
+		}
 	}
 
 	return nil
@@ -574,7 +834,8 @@ func makeKeyAddr(splitAddr address.Address, count uint64) (address.Address, erro
 	return addr, nil
 }
 
-func resetGenesisMsigs(ctx context.Context, sm *StateManager, store adt0.Store, tree *state.StateTree) error {
+// TODO: After the Liftoff epoch, refactor this to use resetMultisigVesting
+func resetGenesisMsigs(ctx context.Context, sm *StateManager, store adt0.Store, tree *state.StateTree, startEpoch abi.ChainEpoch) error {
 	gb, err := sm.cs.GetGenesis()
 	if err != nil {
 		return xerrors.Errorf("getting genesis block: %w", err)
@@ -603,7 +864,7 @@ func resetGenesisMsigs(ctx context.Context, sm *StateManager, store adt0.Store, 
 				return xerrors.Errorf("reading multisig state: %w", err)
 			}
 
-			currState.StartEpoch = build.UpgradeLiftoffHeight
+			currState.StartEpoch = startEpoch
 
 			currActor.Head, err = store.Put(ctx, &currState)
 			if err != nil {
@@ -619,6 +880,37 @@ func resetGenesisMsigs(ctx context.Context, sm *StateManager, store adt0.Store, 
 
 	if err != nil {
 		return xerrors.Errorf("iterating over genesis actors: %w", err)
+	}
+
+	return nil
+}
+
+func resetMultisigVesting(ctx context.Context, store adt0.Store, tree *state.StateTree, addr address.Address, startEpoch abi.ChainEpoch, duration abi.ChainEpoch, balance abi.TokenAmount) error {
+	act, err := tree.GetActor(addr)
+	if err != nil {
+		return xerrors.Errorf("getting actor: %w", err)
+	}
+
+	if !builtin.IsMultisigActor(act.Code) {
+		return xerrors.Errorf("actor wasn't msig: %w", err)
+	}
+
+	var msigState multisig0.State
+	if err := store.Get(ctx, act.Head, &msigState); err != nil {
+		return xerrors.Errorf("reading multisig state: %w", err)
+	}
+
+	msigState.StartEpoch = startEpoch
+	msigState.UnlockDuration = duration
+	msigState.InitialBalance = balance
+
+	act.Head, err = store.Put(ctx, &msigState)
+	if err != nil {
+		return xerrors.Errorf("writing new multisig state: %w", err)
+	}
+
+	if err := tree.SetActor(addr, act); err != nil {
+		return xerrors.Errorf("setting multisig actor: %w", err)
 	}
 
 	return nil

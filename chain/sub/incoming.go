@@ -10,7 +10,6 @@ import (
 	"golang.org/x/xerrors"
 
 	address "github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/specs-actors/actors/util/adt"
 	lru "github.com/hashicorp/golang-lru"
 	blocks "github.com/ipfs/go-block-format"
 	bserv "github.com/ipfs/go-blockservice"
@@ -24,6 +23,8 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 
+	adt0 "github.com/filecoin-project/specs-actors/actors/util/adt"
+
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
@@ -36,12 +37,20 @@ import (
 	"github.com/filecoin-project/lotus/lib/bufbstore"
 	"github.com/filecoin-project/lotus/lib/sigs"
 	"github.com/filecoin-project/lotus/metrics"
+	"github.com/filecoin-project/lotus/node/impl/client"
 )
 
 var log = logging.Logger("sub")
 
 var ErrSoftFailure = errors.New("soft validation failure")
 var ErrInsufficientPower = errors.New("incoming block's miner does not have minimum power")
+
+var msgCidPrefix = cid.Prefix{
+	Version:  1,
+	Codec:    cid.DagCBOR,
+	MhType:   client.DefaultHashFunction,
+	MhLength: 32,
+}
 
 func HandleIncomingBlocks(ctx context.Context, bsub *pubsub.Subscription, s *chain.Syncer, bs bserv.BlockService, cmgr connmgr.ConnManager) {
 	// Timeout after (block time + propagation delay). This is useless at
@@ -119,12 +128,6 @@ func FetchMessagesByCids(
 			return err
 		}
 
-		// FIXME: We already sort in `fetchCids`, we are duplicating too much work,
-		//  we don't need to pass the index.
-		if out[i] != nil {
-			return fmt.Errorf("received duplicate message")
-		}
-
 		out[i] = msg
 		return nil
 	})
@@ -148,10 +151,6 @@ func FetchSignedMessagesByCids(
 			return err
 		}
 
-		if out[i] != nil {
-			return fmt.Errorf("received duplicate message")
-		}
-
 		out[i] = smsg
 		return nil
 	})
@@ -171,37 +170,44 @@ func fetchCids(
 	cids []cid.Cid,
 	cb func(int, blocks.Block) error,
 ) error {
-	fetchedBlocks := bserv.GetBlocks(ctx, cids)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	cidIndex := make(map[cid.Cid]int)
 	for i, c := range cids {
+		if c.Prefix() != msgCidPrefix {
+			return fmt.Errorf("invalid msg CID: %s", c)
+		}
 		cidIndex[c] = i
 	}
+	if len(cids) != len(cidIndex) {
+		return fmt.Errorf("duplicate CIDs in fetchCids input")
+	}
 
-	for i := 0; i < len(cids); i++ {
-		select {
-		case block, ok := <-fetchedBlocks:
-			if !ok {
-				// Closed channel, no more blocks fetched, check if we have all
-				// of the CIDs requested.
-				// FIXME: Review this check. We don't call the callback on the
-				//  last index?
-				if i == len(cids)-1 {
-					break
-				}
-
-				return fmt.Errorf("failed to fetch all messages")
-			}
-
-			ix, ok := cidIndex[block.Cid()]
-			if !ok {
-				return fmt.Errorf("received message we didnt ask for")
-			}
-
-			if err := cb(ix, block); err != nil {
-				return err
-			}
+	for block := range bserv.GetBlocks(ctx, cids) {
+		ix, ok := cidIndex[block.Cid()]
+		if !ok {
+			// Ignore duplicate/unexpected blocks. This shouldn't
+			// happen, but we can be safe.
+			log.Errorw("received duplicate/unexpected block when syncing", "cid", block.Cid())
+			continue
 		}
+
+		// Record that we've received the block.
+		delete(cidIndex, block.Cid())
+
+		if err := cb(ix, block); err != nil {
+			return err
+		}
+	}
+
+	if len(cidIndex) > 0 {
+		err := ctx.Err()
+		if err == nil {
+			err = fmt.Errorf("failed to fetch %d messages for unknown reasons", len(cidIndex))
+		}
+		return err
 	}
 
 	return nil
@@ -384,9 +390,10 @@ func (bv *BlockValidator) isChainNearSynced() bool {
 
 func (bv *BlockValidator) validateMsgMeta(ctx context.Context, msg *types.BlockMsg) error {
 	// TODO there has to be a simpler way to do this without the blockstore dance
-	store := adt.WrapStore(ctx, cbor.NewCborStore(blockstore.NewTemporary()))
-	bmArr := adt.MakeEmptyArray(store)
-	smArr := adt.MakeEmptyArray(store)
+	// block headers use adt0
+	store := adt0.WrapStore(ctx, cbor.NewCborStore(blockstore.NewTemporary()))
+	bmArr := adt0.MakeEmptyArray(store)
+	smArr := adt0.MakeEmptyArray(store)
 
 	for i, m := range msg.BlsMessages {
 		c := cbg.CborCid(m)
@@ -483,14 +490,14 @@ func (bv *BlockValidator) checkPowerAndGetWorkerKey(ctx context.Context, bh *typ
 		return address.Undef, ErrSoftFailure
 	}
 
-	hmp, err := stmgr.MinerHasMinPower(ctx, bv.stmgr, bh.Miner, lbts)
+	eligible, err := stmgr.MinerEligibleToMine(ctx, bv.stmgr, bh.Miner, baseTs, lbts)
 	if err != nil {
 		log.Warnf("failed to determine if incoming block's miner has minimum power: %s", err)
 		return address.Undef, ErrSoftFailure
 	}
 
-	if !hmp {
-		log.Warnf("incoming block's miner does not have minimum power")
+	if !eligible {
+		log.Warnf("incoming block's miner is ineligible")
 		return address.Undef, ErrInsufficientPower
 	}
 

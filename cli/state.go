@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/ioutil"
 	"os"
 	"reflect"
 	"sort"
@@ -14,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/filecoin-project/specs-actors/actors/runtime"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 
 	"github.com/multiformats/go-multiaddr"
 
@@ -30,10 +31,9 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/exitcode"
-	"github.com/filecoin-project/specs-actors/actors/builtin"
-	"github.com/filecoin-project/specs-actors/actors/builtin/exported"
 
 	"github.com/filecoin-project/lotus/api"
+	lapi "github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/api/apibstore"
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/state"
@@ -60,7 +60,7 @@ var stateCmd = &cli.Command{
 		stateSectorCmd,
 		stateGetActorCmd,
 		stateLookupIDCmd,
-		stateReplaySetCmd,
+		stateReplayCmd,
 		stateSectorSizeCmd,
 		stateReadStateCmd,
 		stateListMessagesCmd,
@@ -69,9 +69,9 @@ var stateCmd = &cli.Command{
 		stateGetDealSetCmd,
 		stateWaitMsgCmd,
 		stateSearchMsgCmd,
-		stateMsgCostCmd,
 		stateMinerInfo,
 		stateMarketCmd,
+		stateExecTraceCmd,
 	},
 }
 
@@ -315,20 +315,95 @@ var stateActiveSectorsCmd = &cli.Command{
 	},
 }
 
-var stateReplaySetCmd = &cli.Command{
-	Name:      "replay",
-	Usage:     "Replay a particular message within a tipset",
-	ArgsUsage: "[tipsetKey messageCid]",
+var stateExecTraceCmd = &cli.Command{
+	Name:      "exec-trace",
+	Usage:     "Get the execution trace of a given message",
+	ArgsUsage: "<messageCid>",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() < 1 {
-			fmt.Println("usage: [tipset] <message cid>")
-			fmt.Println("The last cid passed will be used as the message CID")
-			fmt.Println("All preceding ones will be used as the tipset")
+		if !cctx.Args().Present() {
+			return ShowHelp(cctx, fmt.Errorf("must pass message cid"))
+		}
+
+		mcid, err := cid.Decode(cctx.Args().First())
+		if err != nil {
+			return fmt.Errorf("message cid was invalid: %s", err)
+		}
+
+		capi, closer, err := GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		ctx := ReqContext(cctx)
+
+		msg, err := capi.ChainGetMessage(ctx, mcid)
+		if err != nil {
+			return err
+		}
+
+		lookup, err := capi.StateSearchMsg(ctx, mcid)
+		if err != nil {
+			return err
+		}
+
+		ts, err := capi.ChainGetTipSet(ctx, lookup.TipSet)
+		if err != nil {
+			return err
+		}
+
+		pts, err := capi.ChainGetTipSet(ctx, ts.Parents())
+		if err != nil {
+			return err
+		}
+
+		cso, err := capi.StateCompute(ctx, pts.Height(), nil, pts.Key())
+		if err != nil {
+			return err
+		}
+
+		var trace *api.InvocResult
+		for _, t := range cso.Trace {
+			if t.Msg.From == msg.From && t.Msg.Nonce == msg.Nonce {
+				trace = t
+				break
+			}
+		}
+		if trace == nil {
+			return fmt.Errorf("failed to find message in tipset trace output")
+		}
+
+		out, err := json.MarshalIndent(trace, "", "  ")
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(string(out))
+		return nil
+	},
+}
+
+var stateReplayCmd = &cli.Command{
+	Name:      "replay",
+	Usage:     "Replay a particular message",
+	ArgsUsage: "<messageCid>",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "show-trace",
+			Usage: "print out full execution trace for given message",
+		},
+		&cli.BoolFlag{
+			Name:  "detailed-gas",
+			Usage: "print out detailed gas costs for given message",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if cctx.Args().Len() != 1 {
+			fmt.Println("must provide cid of message to replay")
 			return nil
 		}
 
-		args := cctx.Args().Slice()
-		mcid, err := cid.Decode(args[len(args)-1])
+		mcid, err := cid.Decode(cctx.Args().First())
 		if err != nil {
 			return fmt.Errorf("message cid was invalid: %s", err)
 		}
@@ -341,52 +416,7 @@ var stateReplaySetCmd = &cli.Command{
 
 		ctx := ReqContext(cctx)
 
-		var ts *types.TipSet
-		{
-			var tscids []cid.Cid
-			for _, s := range args[:len(args)-1] {
-				c, err := cid.Decode(s)
-				if err != nil {
-					return fmt.Errorf("tipset cid was invalid: %s", err)
-				}
-				tscids = append(tscids, c)
-			}
-
-			if len(tscids) > 0 {
-				var headers []*types.BlockHeader
-				for _, c := range tscids {
-					h, err := fapi.ChainGetBlock(ctx, c)
-					if err != nil {
-						return err
-					}
-
-					headers = append(headers, h)
-				}
-
-				ts, err = types.NewTipSet(headers)
-				if err != nil {
-					return err
-				}
-			} else {
-				var r *api.MsgLookup
-				r, err = fapi.StateWaitMsg(ctx, mcid, build.MessageConfidence)
-				if err != nil {
-					return xerrors.Errorf("finding message in chain: %w", err)
-				}
-
-				childTs, err := fapi.ChainGetTipSet(ctx, r.TipSet)
-				if err != nil {
-					return xerrors.Errorf("loading tipset: %w", err)
-				}
-				ts, err = fapi.ChainGetTipSet(ctx, childTs.Parents())
-				if err != nil {
-					return err
-				}
-			}
-
-		}
-
-		res, err := fapi.StateReplay(ctx, ts.Key(), mcid)
+		res, err := fapi.StateReplay(ctx, types.EmptyTSK, mcid)
 		if err != nil {
 			return xerrors.Errorf("replay call failed: %w", err)
 		}
@@ -395,8 +425,23 @@ var stateReplaySetCmd = &cli.Command{
 		fmt.Printf("Exit code: %d\n", res.MsgRct.ExitCode)
 		fmt.Printf("Return: %x\n", res.MsgRct.Return)
 		fmt.Printf("Gas Used: %d\n", res.MsgRct.GasUsed)
+
+		if cctx.Bool("detailed-gas") {
+			fmt.Printf("Base Fee Burn: %d\n", res.GasCost.BaseFeeBurn)
+			fmt.Printf("Overestimaton Burn: %d\n", res.GasCost.OverEstimationBurn)
+			fmt.Printf("Miner Penalty: %d\n", res.GasCost.MinerPenalty)
+			fmt.Printf("Miner Tip: %d\n", res.GasCost.MinerTip)
+			fmt.Printf("Refund: %d\n", res.GasCost.Refund)
+		}
+		fmt.Printf("Total Message Cost: %d\n", res.GasCost.TotalCost)
+
 		if res.MsgRct.ExitCode != 0 {
 			fmt.Printf("Error message: %q\n", res.Error)
+		}
+
+		if cctx.Bool("show-trace") {
+			fmt.Printf("%s\t%s\t%s\t%d\t%x\t%d\t%x\n", res.Msg.From, res.Msg.To, res.Msg.Value, res.Msg.Method, res.Msg.Params, res.MsgRct.ExitCode, res.MsgRct.Return)
+			printInternalExecutions("\t", res.ExecutionTrace.Subcalls)
 		}
 
 		return nil
@@ -768,33 +813,66 @@ var stateListMessagesCmd = &cli.Command{
 			froma = a
 		}
 
-		toh := cctx.Uint64("toheight")
+		toh := abi.ChainEpoch(cctx.Uint64("toheight"))
 
 		ts, err := LoadTipSet(ctx, cctx, api)
 		if err != nil {
 			return err
 		}
 
-		msgs, err := api.StateListMessages(ctx, &types.Message{To: toa, From: froma}, ts.Key(), abi.ChainEpoch(toh))
-		if err != nil {
-			return err
+		if ts == nil {
+			head, err := api.ChainHead(ctx)
+			if err != nil {
+				return err
+			}
+			ts = head
 		}
 
-		for _, c := range msgs {
-			if cctx.Bool("cids") {
-				fmt.Println(c.String())
-				continue
+		windowSize := abi.ChainEpoch(100)
+
+		cur := ts
+		for cur.Height() > toh {
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 
-			m, err := api.ChainGetMessage(ctx, c)
+			end := toh
+			if cur.Height()-windowSize > end {
+				end = cur.Height() - windowSize
+			}
+
+			msgs, err := api.StateListMessages(ctx, &lapi.MessageMatch{To: toa, From: froma}, cur.Key(), end)
 			if err != nil {
 				return err
 			}
-			b, err := json.MarshalIndent(m, "", "  ")
+
+			for _, c := range msgs {
+				if cctx.Bool("cids") {
+					fmt.Println(c.String())
+					continue
+				}
+
+				m, err := api.ChainGetMessage(ctx, c)
+				if err != nil {
+					return err
+				}
+				b, err := json.MarshalIndent(m, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(b))
+			}
+
+			if end <= 0 {
+				break
+			}
+
+			next, err := api.ChainGetTipSetByHeight(ctx, end-1, cur.Key())
 			if err != nil {
 				return err
 			}
-			fmt.Println(string(b))
+
+			cur = next
 		}
 
 		return nil
@@ -824,6 +902,10 @@ var stateComputeStateCmd = &cli.Command{
 		&cli.BoolFlag{
 			Name:  "json",
 			Usage: "generate json output",
+		},
+		&cli.StringFlag{
+			Name:  "compute-state-output",
+			Usage: "a json file containing pre-existing compute-state output, to generate html reports without rerunning state changes",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -864,9 +946,26 @@ var stateComputeStateCmd = &cli.Command{
 			}
 		}
 
-		stout, err := api.StateCompute(ctx, h, msgs, ts.Key())
-		if err != nil {
-			return err
+		var stout *lapi.ComputeStateOutput
+		if csofile := cctx.String("compute-state-output"); csofile != "" {
+			data, err := ioutil.ReadFile(csofile)
+			if err != nil {
+				return err
+			}
+
+			var o lapi.ComputeStateOutput
+			if err := json.Unmarshal(data, &o); err != nil {
+				return err
+			}
+
+			stout = &o
+		} else {
+			o, err := api.StateCompute(ctx, h, msgs, ts.Key())
+			if err != nil {
+				return err
+			}
+
+			stout = o
 		}
 
 		if cctx.Bool("json") {
@@ -1334,60 +1433,6 @@ var stateSearchMsgCmd = &cli.Command{
 	},
 }
 
-var stateMsgCostCmd = &cli.Command{
-	Name:      "msg-cost",
-	Usage:     "Get the detailed gas costs of a message",
-	ArgsUsage: "[messageCid]",
-	Action: func(cctx *cli.Context) error {
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must specify message cid to get gas costs for")
-		}
-
-		api, closer, err := GetFullNodeAPI(cctx)
-		if err != nil {
-			return err
-		}
-		defer closer()
-
-		ctx := ReqContext(cctx)
-
-		msg, err := cid.Decode(cctx.Args().First())
-		if err != nil {
-			return err
-		}
-
-		tsk := types.EmptyTSK
-
-		ts, err := LoadTipSet(ctx, cctx, api)
-		if err != nil {
-			return err
-		}
-
-		if ts != nil {
-			tsk = ts.Key()
-		}
-
-		mgc, err := api.StateMsgGasCost(ctx, msg, tsk)
-		if err != nil {
-			return err
-		}
-
-		if mgc != nil {
-			fmt.Printf("Message CID: %s", mgc.Message)
-			fmt.Printf("\nGas Used: %d", mgc.GasUsed)
-			fmt.Printf("\nBase Fee Burn: %d", mgc.BaseFeeBurn)
-			fmt.Printf("\nOverestimation Burn: %d", mgc.OverEstimationBurn)
-			fmt.Printf("\nMiner Tip: %d", mgc.MinerTip)
-			fmt.Printf("\nRefund: %d", mgc.Refund)
-			fmt.Printf("\nTotal Cost: %d", mgc.TotalCost)
-			fmt.Printf("\nMiner Penalty: %d", mgc.MinerPenalty)
-		} else {
-			fmt.Print("message was not found on chain")
-		}
-		return nil
-	},
-}
-
 var stateCallCmd = &cli.Command{
 	Name:      "call",
 	Usage:     "Invoke a method on an actor locally",
@@ -1534,28 +1579,18 @@ func parseParamsForMethod(act cid.Cid, method uint64, args []string) ([]byte, er
 		return nil, nil
 	}
 
-	var target runtime.Invokee
-	for _, actor := range exported.BuiltinActors() {
-		if actor.Code() == act {
-			target = actor
-		}
-	}
-	if target == nil {
+	// TODO: consider moving this to a dedicated helper
+	actMeta, ok := stmgr.MethodsMap[act]
+	if !ok {
 		return nil, fmt.Errorf("unknown actor %s", act)
 	}
-	methods := target.Exports()
-	if uint64(len(methods)) <= method || methods[method] == nil {
+
+	methodMeta, ok := actMeta[abi.MethodNum(method)]
+	if !ok {
 		return nil, fmt.Errorf("unknown method %d for actor %s", method, act)
 	}
 
-	f := methods[method]
-
-	rf := reflect.TypeOf(f)
-	if rf.NumIn() != 2 {
-		return nil, fmt.Errorf("expected referenced method to have three arguments")
-	}
-
-	paramObj := rf.In(1).Elem()
+	paramObj := methodMeta.Params
 	if paramObj.NumField() != len(args) {
 		return nil, fmt.Errorf("not enough arguments given to call that method (expecting %d)", paramObj.NumField())
 	}
@@ -1608,7 +1643,14 @@ func parseParamsForMethod(act cid.Cid, method uint64, args []string) ([]byte, er
 
 var stateCircSupplyCmd = &cli.Command{
 	Name:  "circulating-supply",
-	Usage: "Get the current circulating supply of filecoin",
+	Usage: "Get the exact current circulating supply of Filecoin",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "vm-supply",
+			Usage: "calculates the approximation of the circulating supply used internally by the VM (instead of the exact amount)",
+			Value: false,
+		},
+	},
 	Action: func(cctx *cli.Context) error {
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
@@ -1623,16 +1665,26 @@ var stateCircSupplyCmd = &cli.Command{
 			return err
 		}
 
-		circ, err := api.StateCirculatingSupply(ctx, ts.Key())
-		if err != nil {
-			return err
-		}
+		if cctx.IsSet("vm-supply") {
+			circ, err := api.StateVMCirculatingSupplyInternal(ctx, ts.Key())
+			if err != nil {
+				return err
+			}
 
-		fmt.Println("Circulating supply: ", types.FIL(circ.FilCirculating))
-		fmt.Println("Mined: ", types.FIL(circ.FilMined))
-		fmt.Println("Vested: ", types.FIL(circ.FilVested))
-		fmt.Println("Burnt: ", types.FIL(circ.FilBurnt))
-		fmt.Println("Locked: ", types.FIL(circ.FilLocked))
+			fmt.Println("Circulating supply: ", types.FIL(circ.FilCirculating))
+			fmt.Println("Mined: ", types.FIL(circ.FilMined))
+			fmt.Println("Vested: ", types.FIL(circ.FilVested))
+			fmt.Println("Burnt: ", types.FIL(circ.FilBurnt))
+			fmt.Println("Locked: ", types.FIL(circ.FilLocked))
+		} else {
+			circ, err := api.StateCirculatingSupply(ctx, ts.Key())
+			if err != nil {
+				return err
+			}
+
+			fmt.Println("Exact circulating supply: ", types.FIL(circ))
+			return nil
+		}
 
 		return nil
 	},

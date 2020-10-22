@@ -13,9 +13,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/exitcode"
-	"github.com/filecoin-project/test-vectors/schema"
 	"github.com/ipfs/go-blockservice"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
@@ -24,17 +22,19 @@ import (
 	"github.com/ipfs/go-merkledag"
 	"github.com/ipld/go-car"
 
+	"github.com/filecoin-project/test-vectors/schema"
+
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
 	"github.com/filecoin-project/lotus/lib/blockstore"
 )
 
 // ExecuteMessageVector executes a message-class test vector.
-func ExecuteMessageVector(r Reporter, vector *schema.TestVector) {
+func ExecuteMessageVector(r Reporter, vector *schema.TestVector, variant *schema.Variant) {
 	var (
-		ctx   = context.Background()
-		epoch = vector.Pre.Epoch
-		root  = vector.Pre.StateTree.RootCID
+		ctx       = context.Background()
+		baseEpoch = variant.Epoch
+		root      = vector.Pre.StateTree.RootCID
 	)
 
 	// Load the CAR into a new temporary Blockstore.
@@ -46,18 +46,6 @@ func ExecuteMessageVector(r Reporter, vector *schema.TestVector) {
 	// Create a new Driver.
 	driver := NewDriver(ctx, vector.Selector, DriverOpts{DisableVMFlush: true})
 
-	var circSupply *abi.TokenAmount
-	if cs := vector.Pre.CircSupply; cs != nil {
-		ta := big.NewFromGo(cs)
-		circSupply = &ta
-	}
-
-	var basefee *abi.TokenAmount
-	if bf := vector.Pre.BaseFee; bf != nil {
-		ta := big.NewFromGo(bf)
-		basefee = &ta
-	}
-
 	// Apply every message.
 	for i, m := range vector.ApplyMessages {
 		msg, err := types.DecodeMessage(m.Bytes)
@@ -65,19 +53,20 @@ func ExecuteMessageVector(r Reporter, vector *schema.TestVector) {
 			r.Fatalf("failed to deserialize message: %s", err)
 		}
 
-		// add an epoch if one's set.
-		if m.Epoch != nil {
-			epoch = *m.Epoch
+		// add the epoch offset if one is set.
+		if m.EpochOffset != nil {
+			baseEpoch += *m.EpochOffset
 		}
 
 		// Execute the message.
 		var ret *vm.ApplyRet
 		ret, root, err = driver.ExecuteMessage(bs, ExecuteMessageParams{
 			Preroot:    root,
-			Epoch:      abi.ChainEpoch(epoch),
+			Epoch:      abi.ChainEpoch(baseEpoch),
 			Message:    msg,
-			CircSupply: circSupply,
-			BaseFee:    basefee,
+			BaseFee:    BaseFeeOrDefault(vector.Pre.BaseFee),
+			CircSupply: CircSupplyOrDefault(vector.Pre.CircSupply),
+			Rand:       NewReplayingRand(r, vector.Randomness),
 		})
 		if err != nil {
 			r.Fatalf("fatal failure when executing message: %s", err)
@@ -97,10 +86,10 @@ func ExecuteMessageVector(r Reporter, vector *schema.TestVector) {
 }
 
 // ExecuteTipsetVector executes a tipset-class test vector.
-func ExecuteTipsetVector(r Reporter, vector *schema.TestVector) {
+func ExecuteTipsetVector(r Reporter, vector *schema.TestVector, variant *schema.Variant) {
 	var (
 		ctx       = context.Background()
-		prevEpoch = vector.Pre.Epoch
+		baseEpoch = abi.ChainEpoch(variant.Epoch)
 		root      = vector.Pre.StateTree.RootCID
 		tmpds     = ds.NewMapDatastore()
 	)
@@ -116,9 +105,11 @@ func ExecuteTipsetVector(r Reporter, vector *schema.TestVector) {
 
 	// Apply every tipset.
 	var receiptsIdx int
+	var prevEpoch = baseEpoch
 	for i, ts := range vector.ApplyTipsets {
 		ts := ts // capture
-		ret, err := driver.ExecuteTipset(bs, tmpds, root, abi.ChainEpoch(prevEpoch), &ts)
+		execEpoch := baseEpoch + abi.ChainEpoch(ts.EpochOffset)
+		ret, err := driver.ExecuteTipset(bs, tmpds, root, prevEpoch, &ts, execEpoch)
 		if err != nil {
 			r.Fatalf("failed to apply tipset %d message: %s", i, err)
 		}
@@ -133,7 +124,7 @@ func ExecuteTipsetVector(r Reporter, vector *schema.TestVector) {
 			r.Errorf("post receipts root doesn't match; expected: %s, was: %s", expected, actual)
 		}
 
-		prevEpoch = ts.Epoch
+		prevEpoch = execEpoch
 		root = ret.PostStateRoot
 	}
 
@@ -233,7 +224,12 @@ func writeStateToTempCAR(bs blockstore.Blockstore, roots ...cid.Cid) (string, er
 			if link.Cid.Prefix().Codec == cid.FilCommitmentSealed || link.Cid.Prefix().Codec == cid.FilCommitmentUnsealed {
 				continue
 			}
-			out = append(out, link)
+			// ignore things we don't have, the state tree is incomplete.
+			if has, err := bs.Has(link.Cid); err != nil {
+				return nil, err
+			} else if has {
+				out = append(out, link)
+			}
 		}
 		return out, nil
 	}

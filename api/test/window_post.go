@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"os"
 	"strings"
@@ -31,8 +32,10 @@ func init() {
 }
 
 func TestPledgeSector(t *testing.T, b APIBuilder, blocktime time.Duration, nSectors int) {
-	ctx := context.Background()
-	n, sn := b(t, 1, OneMiner)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	n, sn := b(t, OneFull, OneMiner)
 	client := n[0].FullNode.(*impl.FullNodeAPI)
 	miner := sn[0]
 
@@ -46,11 +49,11 @@ func TestPledgeSector(t *testing.T, b APIBuilder, blocktime time.Duration, nSect
 	}
 	build.Clock.Sleep(time.Second)
 
-	mine := true
+	mine := int64(1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for mine {
+		for atomic.LoadInt64(&mine) != 0 {
 			build.Clock.Sleep(blocktime)
 			if err := sn[0].MineOne(ctx, bminer.MineReq{Done: func(bool, abi.ChainEpoch, error) {
 
@@ -62,7 +65,7 @@ func TestPledgeSector(t *testing.T, b APIBuilder, blocktime time.Duration, nSect
 
 	pledgeSectors(t, ctx, miner, nSectors, 0, nil)
 
-	mine = false
+	atomic.StoreInt64(&mine, 0)
 	<-done
 }
 
@@ -114,8 +117,25 @@ func pledgeSectors(t *testing.T, ctx context.Context, miner TestStorageNode, n, 
 }
 
 func TestWindowPost(t *testing.T, b APIBuilder, blocktime time.Duration, nSectors int) {
-	ctx := context.Background()
-	n, sn := b(t, 1, OneMiner)
+	for _, height := range []abi.ChainEpoch{
+		1,    // before
+		162,  // while sealing
+		5000, // while proving
+	} {
+		height := height // copy to satisfy lints
+		t.Run(fmt.Sprintf("upgrade-%d", height), func(t *testing.T) {
+			testWindowPostUpgrade(t, b, blocktime, nSectors, height)
+		})
+	}
+
+}
+func testWindowPostUpgrade(t *testing.T, b APIBuilder, blocktime time.Duration, nSectors int,
+	upgradeHeight abi.ChainEpoch) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	n, sn := b(t, []FullNodeOpts{FullNodeWithUpgradeAt(upgradeHeight)}, OneMiner)
+
 	client := n[0].FullNode.(*impl.FullNodeAPI)
 	miner := sn[0]
 
@@ -129,16 +149,23 @@ func TestWindowPost(t *testing.T, b APIBuilder, blocktime time.Duration, nSector
 	}
 	build.Clock.Sleep(time.Second)
 
-	mine := true
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for mine {
+		for ctx.Err() == nil {
 			build.Clock.Sleep(blocktime)
 			if err := sn[0].MineOne(ctx, MineNext); err != nil {
+				if ctx.Err() != nil {
+					// context was canceled, ignore the error.
+					return
+				}
 				t.Error(err)
 			}
 		}
+	}()
+	defer func() {
+		cancel()
+		<-done
 	}()
 
 	pledgeSectors(t, ctx, miner, nSectors, 0, nil)
@@ -159,7 +186,7 @@ func TestWindowPost(t *testing.T, b APIBuilder, blocktime time.Duration, nSector
 		head, err := client.ChainHead(ctx)
 		require.NoError(t, err)
 
-		if head.Height() > di.PeriodStart+(di.WPoStProvingPeriod)+2 {
+		if head.Height() > di.PeriodStart+di.WPoStProvingPeriod+2 {
 			fmt.Printf("Now head.Height = %d\n", head.Height())
 			break
 		}
@@ -289,12 +316,11 @@ func TestWindowPost(t *testing.T, b APIBuilder, blocktime time.Duration, nSector
 	pledgeSectors(t, ctx, miner, 1, nSectors, nil)
 
 	{
-		// wait a bit more
-
-		head, err := client.ChainHead(ctx)
+		// Wait until proven.
+		di, err = client.StateMinerProvingDeadline(ctx, maddr, types.EmptyTSK)
 		require.NoError(t, err)
 
-		waitUntil := head.Height() + 10
+		waitUntil := di.PeriodStart + di.WPoStProvingPeriod + 2
 		fmt.Printf("End for head.Height > %d\n", waitUntil)
 
 		for {
@@ -315,7 +341,4 @@ func TestWindowPost(t *testing.T, b APIBuilder, blocktime time.Duration, nSector
 
 	sectors = p.MinerPower.RawBytePower.Uint64() / uint64(ssz)
 	require.Equal(t, nSectors+GenesisPreseals-2+1, int(sectors)) // -2 not recovered sectors + 1 just pledged
-
-	mine = false
-	<-done
 }

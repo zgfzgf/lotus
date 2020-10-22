@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
@@ -17,11 +18,13 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+
 	"github.com/filecoin-project/specs-actors/actors/builtin"
-	"github.com/filecoin-project/specs-actors/actors/util/adt"
+	adt0 "github.com/filecoin-project/specs-actors/actors/util/adt"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/vm"
 	"github.com/filecoin-project/lotus/journal"
 	bstore "github.com/filecoin-project/lotus/lib/blockstore"
@@ -36,7 +39,9 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-datastore"
 	dstore "github.com/ipfs/go-datastore"
+	"github.com/ipfs/go-datastore/query"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	logging "github.com/ipfs/go-log/v2"
 	car "github.com/ipld/go-car"
@@ -100,7 +105,7 @@ type HeadChangeEvt struct {
 //   2. a block => messages references cache.
 type ChainStore struct {
 	bs bstore.Blockstore
-	ds dstore.Datastore
+	ds dstore.Batching
 
 	heaviestLk sync.Mutex
 	heaviest   *types.TipSet
@@ -122,11 +127,15 @@ type ChainStore struct {
 	vmcalls vm.SyscallBuilder
 
 	evtTypes [1]journal.EventType
+	journal  journal.Journal
 }
 
-func NewChainStore(bs bstore.Blockstore, ds dstore.Batching, vmcalls vm.SyscallBuilder) *ChainStore {
+func NewChainStore(bs bstore.Blockstore, ds dstore.Batching, vmcalls vm.SyscallBuilder, j journal.Journal) *ChainStore {
 	c, _ := lru.NewARC(DefaultMsgMetaCacheSize)
 	tsc, _ := lru.NewARC(DefaultTipSetCacheSize)
+	if j == nil {
+		j = journal.NilJournal()
+	}
 	cs := &ChainStore{
 		bs:       bs,
 		ds:       ds,
@@ -135,10 +144,11 @@ func NewChainStore(bs bstore.Blockstore, ds dstore.Batching, vmcalls vm.SyscallB
 		mmCache:  c,
 		tsCache:  tsc,
 		vmcalls:  vmcalls,
+		journal:  j,
 	}
 
 	cs.evtTypes = [1]journal.EventType{
-		evtTypeHeadChange: journal.J.RegisterEventType("sync", "head_change"),
+		evtTypeHeadChange: j.RegisterEventType("sync", "head_change"),
 	}
 
 	ci := NewChainIndex(cs.LoadTipSet)
@@ -377,7 +387,7 @@ func (cs *ChainStore) reorgWorker(ctx context.Context, initialNotifees []ReorgNo
 					continue
 				}
 
-				journal.J.RecordEvent(cs.evtTypes[evtTypeHeadChange], func() interface{} {
+				cs.journal.RecordEvent(cs.evtTypes[evtTypeHeadChange], func() interface{} {
 					return HeadChangeEvt{
 						From:        r.old.Key(),
 						FromHeight:  r.old.Height(),
@@ -435,6 +445,53 @@ func (cs *ChainStore) takeHeaviestTipSet(ctx context.Context, ts *types.TipSet) 
 		log.Errorf("failed to write chain head: %s", err)
 		return nil
 	}
+
+	return nil
+}
+
+// FlushValidationCache removes all results of block validation from the
+// chain metadata store. Usually the first step after a new chain import.
+func (cs *ChainStore) FlushValidationCache() error {
+	log.Infof("clearing block validation cache...")
+
+	dsWalk, err := cs.ds.Query(query.Query{
+		// Potential TODO: the validation cache is not a namespace on its own
+		// but is rather constructed as prefixed-key `foo:bar` via .Instance(), which
+		// in turn does not work with the filter, which can match only on `foo/bar`
+		//
+		// If this is addressed (blockcache goes into its own sub-namespace) then
+		// strings.HasPrefix(...) below can be skipped
+		//
+		//Prefix: blockValidationCacheKeyPrefix.String()
+		KeysOnly: true,
+	})
+	if err != nil {
+		return xerrors.Errorf("failed to initialize key listing query: %w", err)
+	}
+
+	allKeys, err := dsWalk.Rest()
+	if err != nil {
+		return xerrors.Errorf("failed to run key listing query: %w", err)
+	}
+
+	batch, err := cs.ds.Batch()
+	if err != nil {
+		return xerrors.Errorf("failed to open a DS batch: %w", err)
+	}
+
+	delCnt := 0
+	for _, k := range allKeys {
+		if strings.HasPrefix(k.Key, blockValidationCacheKeyPrefix.String()) {
+			delCnt++
+			batch.Delete(datastore.RawKey(k.Key)) // nolint:errcheck
+		}
+	}
+
+	if err := batch.Commit(); err != nil {
+		return xerrors.Errorf("failed to commit the DS batch: %w", err)
+	}
+
+	log.Infof("%d block validation entries cleared.", delCnt)
 
 	return nil
 }
@@ -757,7 +814,8 @@ func (cs *ChainStore) GetSignedMessage(c cid.Cid) (*types.SignedMessage, error) 
 
 func (cs *ChainStore) readAMTCids(root cid.Cid) ([]cid.Cid, error) {
 	ctx := context.TODO()
-	a, err := adt.AsArray(cs.Store(ctx), root)
+	// block headers use adt0, for now.
+	a, err := adt0.AsArray(cs.Store(ctx), root)
 	if err != nil {
 		return nil, xerrors.Errorf("amt load: %w", err)
 	}
@@ -950,7 +1008,8 @@ func (cs *ChainStore) MessagesForBlock(b *types.BlockHeader) ([]*types.Message, 
 
 func (cs *ChainStore) GetParentReceipt(b *types.BlockHeader, i int) (*types.MessageReceipt, error) {
 	ctx := context.TODO()
-	a, err := adt.AsArray(cs.Store(ctx), b.ParentMessageReceipts)
+	// block headers use adt0, for now.
+	a, err := adt0.AsArray(cs.Store(ctx), b.ParentMessageReceipts)
 	if err != nil {
 		return nil, xerrors.Errorf("amt load: %w", err)
 	}
